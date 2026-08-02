@@ -1,0 +1,10 @@
+build/
+itch_data
+*.wal
+*.exe
+*.o
+*.obj
+*.a
+.vscode/
+.cache/
+compile_commands.json
