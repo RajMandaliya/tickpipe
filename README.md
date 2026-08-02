@@ -192,6 +192,27 @@ the uncompressed file at the repository root as `itch_data`, or pass a path.
 
 The file is not included here — it is 8.7 GB.
 
+## Program output
+
+```
+[ 7 ] Real NASDAQ Market Data Replay
+  ------------------------------------------------------------
+  File     : 07302019.NASDAQ_ITCH50 (July 30 2019)
+  Symbol   : AAPL
+  ...paste the whole demo 7 block...
+```
+
+Live book during replay, paced to the ITCH clock at 300x:
+
+```
+  tickpipe  AAPL    19:24:13.233   300x
+  ============================================================
+    ORDERS    BID QTY      BID | ASK      ASK QTY    ORDERS
+  ------------------------------------------------------------
+         1        100   217.66 | 217.74   281        4
+  ...paste the rest...
+```
+
 ## Known limitations
 
 Stated deliberately, because they are the interesting part.

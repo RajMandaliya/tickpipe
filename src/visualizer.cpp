@@ -46,7 +46,7 @@ void Visualizer::render(const SoftwareEngine& eng,
     move_to_top();
 
     set_white();
-    std::printf("  ExchangeCore  %-6s  %s", info.symbol, clock);
+    std::printf("  Tickpipe  %-6s  %s", info.symbol, clock);
     if (info.speed > 0.0) std::printf("   %.0fx", info.speed);
     std::printf("                    \n");
     set_dim();
