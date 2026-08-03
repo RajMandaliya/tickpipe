@@ -25,6 +25,7 @@ int main(int argc, char* argv[]) {
 
     std::printf("\nStats:\n");
     std::printf("  Packets sent : %llu\n", server.packets_sent());
+    std::printf("  Messages sent : %llu\n", server.messages_sent());
     std::printf("  Bytes sent   : %.1f GB\n",
                 server.bytes_sent() / 1e9);
 

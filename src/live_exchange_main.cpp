@@ -8,6 +8,7 @@
 #include "wal.hpp"
 #include "visualizer.hpp"
 #include "numa.hpp"
+#include "symbol_directory.hpp"
 
 // The consumer side of the feed. It does not care whether bytes arrive from a
 // file replay, a UDP replay server, or a live exchange socket — only that they
@@ -33,39 +34,34 @@ static void on_order(const Order& msg, void* ctx) {
     ++s->messages;
     s->last_ts = msg.timestamp_ns;
 
-    // bare order refs become real book operations here
     ResolveResult r;
-    if (!s->book->resolve(msg, r)) return;
+    if (s->book->resolve(msg, r)) {
+        for (uint8_t i = 0; i < r.count; ++i) {
+            const ResolvedOp& op = r.ops[i];
+            MatchResult empty{};
 
-    for (uint8_t i = 0; i < r.count; ++i) {
-        const ResolvedOp& op = r.ops[i];
-        MatchResult empty{};
+            if (op.action == Action::Add) {
+                Order probe{};
+                probe.order_ref    = op.order_ref;
+                probe.price        = op.price;
+                probe.quantity     = op.quantity;
+                probe.side         = op.side;
+                probe.timestamp_ns = op.timestamp_ns;
+                probe.valid        = 1;
+                std::memcpy(probe.stock, op.stock, 8);
 
-        // risk gates new liquidity only. blocking a cancel or delete would
-        // leave a phantom order resting that the feed thinks is gone.
-        if (op.action == Action::Add) {
-            Order probe{};
-            probe.order_ref    = op.order_ref;
-            probe.price        = op.price;
-            probe.quantity     = op.quantity;
-            probe.side         = op.side;
-            probe.timestamp_ns = op.timestamp_ns;
-            probe.valid        = 1;
-            std::memcpy(probe.stock, op.stock, 8);
-
-            if (s->risk->check(probe) != RiskResult::Accepted) {
-                s->wal->append(WalEntryType::OrderRejected, probe, empty);
-                ++s->rejected;
-                continue;
+                if (s->risk->check(probe) != RiskResult::Accepted) {
+                    s->wal->append(WalEntryType::OrderRejected, probe, empty);
+                    ++s->rejected;
+                    continue;
+                }
+                s->wal->append(WalEntryType::OrderSubmitted, probe, empty);
             }
-            s->wal->append(WalEntryType::OrderSubmitted, probe, empty);
+            s->engine->apply(op);
         }
-
-        s->engine->apply(op);
     }
 
-    // redraw on a wall clock, not a message count — message rate varies by
-    // orders of magnitude across the session
+    // render regardless — a blank screen tells you nothing
     const auto now = LiveClock::now();
     if (now >= s->next_render) {
         Visualizer::SessionInfo info{};
@@ -77,7 +73,7 @@ static void on_order(const Order& msg, void* ctx) {
         info.last_price   = s->engine->last_price();
         info.speed        = 0.0;
         s->viz->render(*s->engine, info);
-        s->next_render = now + std::chrono::milliseconds(40);
+        s->next_render = now + std::chrono::milliseconds(100);
     }
 }
 
@@ -132,7 +128,19 @@ int main() {
     const auto t_start = LiveClock::now();
 
     // blocking — returns when replay server finishes
-    receiver.receive_loop(on_order, &state);
+
+    SymbolDirectory dir;
+    dir.subscribe("AAPL");
+
+    ReceiverConfig rcfg;
+    rcfg.directory = &dir;
+    rcfg.idle_timeout_ms = 30000;
+
+    receiver.receive_loop(on_order, &state, rcfg);
+
+    std::printf("\n  Symbols known    : %u\n", dir.known_count());
+    std::printf("  Subscribed       : %u\n", dir.subscribed_count());
+    std::printf("  Unmatched names  : %u\n", dir.unmatched_count());
 
     const double elapsed =
         std::chrono::duration<double>(LiveClock::now() - t_start).count();
@@ -151,13 +159,26 @@ int main() {
     std::printf("  Cancels          : %llu\n", bs.cancels);
     std::printf("  Deletes          : %llu\n", bs.deletes);
     std::printf("  Replaces         : %llu\n", bs.replaces);
+    std::printf("  Filtered out     : %llu\n", receiver.messages_filtered());
+    std::printf("  Directory msgs   : %llu\n", receiver.directory_messages());
+    std::printf("  Short packets    : %llu\n", receiver.short_packets());
     std::printf("  Unresolved refs  : %llu\n", bs.unresolved);
     std::printf("  Peak live orders : %llu\n", bs.peak_live);
     std::printf("  Orphan ops       : %llu\n", engine.orphan_ops());
     std::printf("  Risk rejected    : %llu\n", state.rejected);
     std::printf("  Shares traded    : %llu\n", engine.shares_traded());
     std::printf("  WAL entries      : %llu\n", wal.entries_written());
+    std::printf("  Gaps detected    : %llu\n", receiver.gaps());
+    std::printf("  Messages lost    : %llu\n", receiver.messages_lost());
+    std::printf("  Out of order     : %llu\n", receiver.out_of_order());
+    std::printf("  Ring drops       : %llu\n", receiver.ring_dropped());
+    std::printf("  Ring high water  : %.1f MB\n",
+                receiver.ring_high_water() / 1048576.0);
     std::printf("  Elapsed          : %.2f sec\n", elapsed);
+    const double p = receiver.process_ns() / 1e9;
+    const double i = receiver.idle_ns() / 1e9;
+    std::printf("  Book processing  : %.1f s (%.0f%%)\n", p, 100*p/(p+i));
+    std::printf("  Book idle        : %.1f s (%.0f%%)\n", i, 100*i/(p+i));
     if (elapsed > 0.0)
         std::printf("  Throughput       : %.2fM msg/sec\n",
                     state.messages / elapsed / 1e6);

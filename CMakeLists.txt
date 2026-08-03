@@ -28,6 +28,9 @@ if(WIN32)
     target_link_libraries(exchange_core_lib PUBLIC ws2_32)
 endif()
 
+find_package(Threads REQUIRED)
+target_link_libraries(exchange_core_lib PUBLIC ws2_32 Threads::Threads)
+
 target_include_directories(exchange_core_lib PUBLIC include)
 
 # Main executable

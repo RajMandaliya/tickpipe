@@ -2,12 +2,16 @@
 
 A hardware-accurate electronic exchange, written in C++20, that replays a full
 day of real NASDAQ TotalView-ITCH 5.0 market data and reconstructs the order
-book message by message.
+book message by message — from a file, or over a UDP feed.
 
 The matching engine is modelled as a 5-stage FPGA pipeline: fixed-width
 registers between stages, a price-indexed ladder instead of a searched table,
 no heap allocation on the hot path, and fixed-point arithmetic throughout. A
 conventional STL engine runs alongside it as a control.
+
+The feed handler speaks MoldUDP64, the same framing NASDAQ wraps ITCH in, with
+sequence-level gap accounting and a lock-free ring between the socket thread
+and the book thread.
 
 ## Verified against a real trading day
 
@@ -79,6 +83,74 @@ closing bell. Same input file produces the same two values on any machine, any
 compiler, any optimisation level. This is the conformance check: two engines
 that agree on these agree on everything.
 
+## The UDP feed handler
+
+The file replay and the socket feed drive the same consumer. Only the source
+changes.
+
+```
+[replay server] --MoldUDP64/UDP--> [feed handler] --> book
+ reads ITCH file                    same pipeline as the file path
+ paces to the ITCH clock
+```
+
+Replaying the entire day over loopback at 300x:
+
+| | |
+|---|---|
+| Messages sent | 282,229,684 |
+| Packets sent | 6,259,367 (45.1 msgs/packet) |
+| Packets received | 6,259,367 |
+| Messages lost | 0 |
+| Gaps detected | 0 |
+| Ring high water | 23 MB of 128 MB |
+| Send rate | 1.38M msg/s |
+
+Every book counter matches the file replay exactly — 611,614 adds, 568,438
+deletes, 7,218,530 shares, zero unresolved references. The reconstructed book
+closes uncrossed at $218.01 / $218.12.
+
+### Why it is built this way
+
+**MoldUDP64 framing.** Each datagram carries a session id, the sequence number
+of its first message, and a message count. Without sequencing a receiver cannot
+tell a complete stream from a lossy one — it silently builds a corrupt book and
+reports success. With it, every missing message is counted.
+
+**Batching.** Roughly 45 ITCH messages per datagram. One message per packet
+meant 282M datagrams and a receiver bound by syscall rate rather than
+bandwidth.
+
+**A lock-free SPSC ring between socket and book.** The receive thread does
+nothing but `recv()` and a memcpy; the book thread parses, resolves and renders
+at its own pace. Sharing one thread meant every microsecond spent resolving an
+order reference was a microsecond the kernel buffer spent filling, and bursts
+were lost. Moving the buffer into userspace turns an 8 MB kernel limit into a
+128 MB one.
+
+**Symbol filtering at the receiver.** The exchange multicasts every symbol; the
+handler subscribes and discards the rest, dropping 99.5% of messages on a
+`stock_locate` lookup before the parser runs. This is what a real feed handler
+does, and it is also the only way one book means anything — 8,849 symbols in a
+single ladder produces bids above asks and nothing else.
+
+### What loss actually costs
+
+An earlier build lost 24% of messages. Tuning packet size and replay speed
+moved that to 23% and then to 62%; none of it was the real problem. The
+bottleneck turned out to be the terminal — a full-screen ANSI redraw costs
+~30 ms on a Windows console, and at 40 ms intervals the book thread spent 85%
+of its time drawing. Assembling each frame in memory and writing it with a
+single `fwrite` took that to 10%, and loss went to zero.
+
+The intermediate result is worth recording. At 99.93% delivery the book was
+still visibly wrong: 453 missing deletes strand 453 orders in the book
+permanently, and one stale ask from mid-morning is enough to cross against an
+after-hours bid. Market data does not degrade gracefully — errors are
+permanent and cumulative. That is why exchanges run redundant A/B feeds,
+publish periodic snapshots, and support retransmission. Detection is not
+recovery.
+
 ## Performance
 
 Machine dependent, unlike everything above. Measured on Windows, MSYS2 UCRT64,
@@ -107,7 +179,7 @@ the page cache and is not quoted as a result.
 ## Architecture
 
 ```
-  ITCH bytes
+  ITCH bytes  (file, or MoldUDP64 over UDP)
       |
       v
   ItchParser ......... dispatch on message type, per-type length validation
@@ -159,12 +231,14 @@ faster and more faithful to what it claims to model.
 | `pipeline` | 5-stage FPGA model with price ladder |
 | `software_engine` | STL matching engine, used as a control |
 | `itch_replay` | Memory-mapped file replay with symbol filtering |
+| `udp_server` | MoldUDP64 replay server, batching and ITCH-clock pacing |
+| `udp_receiver` | Feed handler: socket thread, gap detection, symbol filter |
+| `spsc_ring` | Lock-free single-producer/single-consumer byte ring |
 | `risk_engine` | Pre-trade checks: fat finger, price bands, zero quantity |
 | `wal` | Write-ahead log and crash recovery |
 | `ouch` | OUCH binary order entry serialisation |
-| `numa` | Core pinning for the matching thread |
-| `visualizer` | Terminal book display, reads a depth snapshot |
-| `udp_server` / `udp_receiver` | Feed transport, replay server and receiver |
+| `numa` | Core pinning for the matching and socket threads |
+| `visualizer` | Terminal book display, single buffered write per frame |
 
 ## Build
 
@@ -179,11 +253,21 @@ ninja
 Binaries:
 
 ```
-exchange_main    all demos, including the full-day replay
+exchange_main    all demos, including the full-day file replay
 benchmark        latency and throughput suite
-replay_server    reads an ITCH file, sends over UDP
 live_exchange    binds UDP, runs the full pipeline
+replay_server    reads an ITCH file, sends MoldUDP64
 ```
+
+Run the feed end to end in two terminals:
+
+```bash
+./live_exchange.exe
+./replay_server.exe /path/to/itch_data 300
+```
+
+Launch order does not matter — the receiver blocks until the first packet and
+uses an idle timeout to detect end of stream.
 
 ## Data
 
@@ -192,30 +276,13 @@ the uncompressed file at the repository root as `itch_data`, or pass a path.
 
 The file is not included here — it is 8.7 GB.
 
-## Program output
-
-```
-[ 7 ] Real NASDAQ Market Data Replay
-  ------------------------------------------------------------
-  File     : 07302019.NASDAQ_ITCH50 (July 30 2019)
-  Symbol   : AAPL
-  ...paste the whole demo 7 block...
-```
-
-Live book during replay, paced to the ITCH clock at 300x:
-
-```
-  tickpipe  AAPL    19:24:13.233   300x
-  ============================================================
-    ORDERS    BID QTY      BID | ASK      ASK QTY    ORDERS
-  ------------------------------------------------------------
-         1        100   217.66 | 217.74   281        4
-  ...paste the rest...
-```
-
 ## Known limitations
 
 Stated deliberately, because they are the interesting part.
+
+**No gap recovery.** Losses are detected and counted precisely, but nothing
+repairs them. The complete answer is redundant A/B feeds plus a retransmission
+request channel, which is what NASDAQ actually operates.
 
 **Single symbol at a time.** One book per process. Real handlers either filter
 to a subscribed universe, as this does, or run per-symbol books keyed on
@@ -232,17 +299,18 @@ auction prints. The official closing price comes from the closing cross, so the
 16:00 figure above is the last continuous-session trade, not the official
 close.
 
+**Risk gating on replayed data is questionable.** The live path runs incoming
+adds through the risk engine, which rejects a few thousand orders that the real
+exchange accepted. Their later deletes then have nothing to remove. Risk checks
+belong on order entry, not on a market data replay.
+
 **Order references are not recycled across days.** `stock_locate` and order
 reference numbers are valid for one trading session only.
 
-**No gap detection.** The UDP path does not yet track sequence discontinuities.
-Real market data feeds drop packets, which is why exchanges publish redundant
-A/B feeds and periodic book snapshots.
-
 ## Next
 
+- Gap recovery: A/B feed arbitration and retransmission requests
 - Cross trade (`Q`) handling for true auction prices
-- Sequence gap detection and A/B feed arbitration on the UDP path
-- Live socket feed — the file replay and the socket feed the same consumer, so
-  only the source changes
 - Per-symbol books keyed on `stock_locate`
+- Live socket feed — the file and UDP paths already share the consumer, so
+  only the source changes
