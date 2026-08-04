@@ -151,6 +151,97 @@ permanent and cumulative. That is why exchanges run redundant A/B feeds,
 publish periodic snapshots, and support retransmission. Detection is not
 recovery.
 
+## Microstructure analytics in integer fixed point
+
+The book is only half the problem. The other half is computing something
+useful from it — and doing so under the constraint the rest of the system
+already accepts: no floating point.
+
+That constraint is not stylistic. An FPGA has no FPU. And `float64` results
+are not reproducible across compilers or optimisation levels, so a floating
+point implementation cannot be checksummed the way everything else here is.
+
+Five metrics, all computed on the reconstructed AAPL book:
+
+**Microprice** (Stoikov) — size-weighted fair value.
+
+```
+P = (P_bid * Q_ask + P_ask * Q_bid) / (Q_bid + Q_ask)
+```
+
+The weights are crossed deliberately: heavy bid size pulls fair value toward
+the ask, because the thin side is the side that moves.
+
+**Order flow imbalance** (Cont-Kukanov-Stoikov) — signed pressure per book
+update, one of the few genuinely predictive short-horizon signals. Requires
+exact per-message book updates, which is what this system produces and a
+snapshot feed cannot.
+
+**Effective spread** — `2 * |P_trade - P_mid|`, the real cost of crossing.
+
+**Realized volatility** — the square root of summed squared log returns.
+
+**Kyle's lambda** — price impact per share, the slope of mid change regressed
+on signed volume.
+
+### Results at the closing bell, 30 July 2019
+
+```
+Microprice        $208.879286
+Mid               $208.870000
+Micro - mid       $+0.009286
+Order flow imbal  -184,765 shares
+Realized vol      0.041914177 over 73,864 returns
+Kyle lambda       0.000000552259 $/share
+Effective spread  0.68 bps
+Degenerate books  0
+```
+
+The microprice sits inside the four-cent spread reported above and leans
+0.93 cents toward the ask, because 3,600 shares were bid against 1,317
+offered. `Degenerate books: 0` means that across 496,380 top-of-book updates
+the engine never once produced a locked or crossed state.
+
+An effective spread under one basis point is what the most liquid name on the
+exchange should look like. Lambda says ten thousand shares move the mid about
+half a cent.
+
+### Accuracy
+
+Every metric has a `float64` twin. The validation harness runs both over
+1.3M book updates and reports the divergence.
+
+| metric | max error |
+|---|---|
+| microprice | 4.716e-11 relative |
+| mid | 0 (exact) |
+| order flow imbalance | 0 (exact) |
+| effective spread | 0 (exact) |
+| realized volatility | 6.985e-07 relative |
+| Kyle's lambda | 9.455e-13 absolute, $/share |
+
+Results are **bit-identical at `-O0` and `-O2`**, which the float64 version is
+not — the compiler is free to reassociate and to use extended intermediate
+precision, so the same source produces different numbers at different
+optimisation levels.
+
+### Where the exact zeros come from
+
+Mid, effective spread and order flow imbalance never divide. The midpoint is
+carried *doubled* — `P_bid + P_ask` rather than `(P_bid + P_ask) / 2` — so the
+half-tick that rounding would discard never exists. Effective spread is
+`|2P - (P_bid + P_ask)|`, the same trick.
+
+Realized volatility needed the most care. Returns are held at 1e-12, not 1e-9:
+quantizing a 1e-4 return to 1e-9 is already a 1e-5 relative error, and that,
+not the series, was the binding constraint. `log(1+x)` uses four terms, which
+bounds truncation at `|x|^5/5 < 2e-21`. Squared returns accumulate in
+`unsigned __int128`, and the square root is computed bit by bit — `std::sqrt`
+returns a `double` and would poison the determinism.
+
+Kyle's lambda is reported as an absolute error because it legitimately crosses
+zero, where relative error is undefined.
+
 ## Performance
 
 Machine dependent, unlike everything above. Measured on Windows, MSYS2 UCRT64,
@@ -238,6 +329,7 @@ faster and more faithful to what it claims to model.
 | `wal` | Write-ahead log and crash recovery |
 | `ouch` | OUCH binary order entry serialisation |
 | `numa` | Core pinning for the matching and socket threads |
+| `microstructure` | Fixed-point microprice, OFI, spread, volatility, Kyle's lambda |
 | `visualizer` | Terminal book display, single buffered write per frame |
 
 ## Build
@@ -253,10 +345,11 @@ ninja
 Binaries:
 
 ```
-exchange_main    all demos, including the full-day file replay
-benchmark        latency and throughput suite
-live_exchange    binds UDP, runs the full pipeline
-replay_server    reads an ITCH file, sends MoldUDP64
+exchange_main             all demos, including the full-day file replay
+benchmark                 latency and throughput suite
+validate_microstructure   fixed-point vs float64 error bounds
+live_exchange             binds UDP, runs the full pipeline
+replay_server             reads an ITCH file, sends MoldUDP64
 ```
 
 Run the feed end to end in two terminals:

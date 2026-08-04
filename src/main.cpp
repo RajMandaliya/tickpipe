@@ -1,7 +1,6 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
-#include <vector>
 #include <algorithm>
 #include <thread>
 #include "itch_parser.hpp"
@@ -16,6 +15,7 @@
 #include "book_state.hpp"
 #include "software_engine.hpp"
 #include "symbol_directory.hpp"
+#include "microstructure.hpp"
 
 static uint64_t now_ns() {
     return static_cast<uint64_t>(
@@ -23,13 +23,6 @@ static uint64_t now_ns() {
             .time_since_epoch()
             .count()
     );
-}
-
-static uint64_t percentile(std::vector<uint64_t>& v, double p) {
-    if (v.empty()) return 0;
-    size_t idx = static_cast<size_t>(p / 100.0 * v.size());
-    if (idx >= v.size()) idx = v.size() - 1;
-    return v[idx];
 }
 
 static void divider() {
@@ -346,9 +339,12 @@ constexpr uint64_t MARKET_CLOSE = 57600000000000ULL;
 struct ReplayCtx {
     BookState*      book;
     SoftwareEngine* engine;
+    Microstructure* micro;
+    Microstructure::Metrics close_micro;
 
-    // the book is empty by 20:00 — every order gets cancelled after hours —
-    // so end-of-file state says nothing. snapshot at the bell instead.
+    // only recompute analytics when the top of book actually moves
+    uint32_t last_bp, last_bq, last_ap, last_aq;
+
     bool     close_taken;
     uint64_t close_digest;
     uint32_t close_bid_px, close_bid_qty;
@@ -367,6 +363,7 @@ void on_message(const Order& msg, void* ctx) {
         c->close_digest     = c->engine->book_digest();
         c->engine->best_bid(c->close_bid_px, c->close_bid_qty);
         c->engine->best_ask(c->close_ask_px, c->close_ask_qty);
+        c->close_micro = c->micro->metrics();
         c->close_last       = c->engine->last_price();
         c->close_shares     = c->engine->shares_traded();
         c->close_bid_levels = c->engine->bid_levels();
@@ -375,8 +372,28 @@ void on_message(const Order& msg, void* ctx) {
 
     ResolveResult r;
     if (!c->book->resolve(msg, r)) return;
-    for (uint8_t i = 0; i < r.count; ++i)
-        c->engine->apply(r.ops[i]);
+    for (uint8_t i = 0; i < r.count; ++i) {
+        const ResolvedOp& op = r.ops[i];
+        c->engine->apply(op);
+
+        // a printed execution is a trade. the aggressor is opposite the
+        // resting order: hitting an ask means a buyer initiated it.
+        if ((op.action == Action::Execute || op.action == Action::Trade)
+            && op.match_number != 0) {
+            c->micro->on_trade(op.price, op.quantity,
+                               op.side == Side::Sell);
+        }
+    }
+
+    uint32_t bp = 0, bq = 0, ap = 0, aq = 0;
+    if (c->engine->best_bid(bp, bq) && c->engine->best_ask(ap, aq)) {
+        if (bp != c->last_bp || bq != c->last_bq ||
+            ap != c->last_ap || aq != c->last_aq) {
+            c->micro->on_book(bp, bq, ap, aq);
+            c->last_bp = bp; c->last_bq = bq;
+            c->last_ap = ap; c->last_aq = aq;
+        }
+    }
 }
 
 using PaceClock = std::chrono::steady_clock;
@@ -500,9 +517,12 @@ static void demo_real_data() {
 
     BookState      book(20);        // 1M slots, plenty for one symbol
     SoftwareEngine engine;
+    Microstructure micro;
+
     ReplayCtx      ctx{};
     ctx.book   = &book;
     ctx.engine = &engine;
+    ctx.micro = &micro;
 
     ReplayConfig cfg;
     cfg.directory = &dir;           // max_messages stays 0 = whole file
@@ -563,6 +583,31 @@ static void demo_real_data() {
     std::printf("  Orphan ops       : %llu\n", engine.orphan_ops());
     std::printf("  Op digest        : 0x%016llx\n",
                 static_cast<unsigned long long>(book.digest()));
+
+    // metrics as of the closing bell. sampling at end of file lands in the
+    // after-hours drain, where the book is dollars wide and the numbers are
+    // real but meaningless.
+    const auto& mm = ctx.close_micro;
+    auto bps = [](const Microstructure::Metrics& x) {
+        if (x.effective_spread_n == 0 || x.mid_1e8 == 0) return 0.0;
+        const double avg = static_cast<double>(x.effective_spread_sum_1e4)
+                         / static_cast<double>(x.effective_spread_n);
+        return avg / (static_cast<double>(x.mid_1e8) / 1e4) * 10000.0;
+    };
+
+    std::printf("\n  -- microstructure at the bell (integer fixed point) --\n");
+    std::printf("  Book updates     : %llu\n", mm.book_updates);
+    std::printf("  Degenerate books : %llu\n", mm.degenerate_books);
+    std::printf("  Trades observed  : %llu\n", mm.trades);
+    std::printf("  Microprice       : $%.6f\n", mm.microprice_1e8 / 1e8);
+    std::printf("  Mid              : $%.6f\n", mm.mid_1e8 / 1e8);
+    std::printf("  Micro - mid      : $%+.6f\n", mm.micro_minus_mid_1e8 / 1e8);
+    std::printf("  Order flow imbal : %+lld shares\n", (long long)mm.ofi);
+    std::printf("  Realized vol     : %.9f over %llu returns\n",
+                mm.realized_vol_1e9 / 1e9, mm.return_samples);
+    std::printf("  Kyle lambda      : %.12f $/share\n",
+                mm.kyle_lambda_1e12 / 1e12);
+    std::printf("  Effective spread : %.2f bps\n", bps(mm));                
 
     // ---- this machine only ----
     std::printf("\n  -- timing (this machine, cache state affects result) --\n");

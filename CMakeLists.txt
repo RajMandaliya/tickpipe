@@ -22,6 +22,7 @@ add_library(exchange_core_lib STATIC
     src/udp_receiver.cpp
     src/book_state.cpp
     src/symbol_directory.cpp
+    src/microstructure.cpp
 )
 
 if(WIN32)
@@ -48,3 +49,6 @@ target_link_libraries(replay_server PRIVATE exchange_core_lib)
 # Live exchange — receives UDP, runs full pipeline
 add_executable(live_exchange src/live_exchange_main.cpp)
 target_link_libraries(live_exchange PRIVATE exchange_core_lib)
+
+add_executable(validate_microstructure bench/validate_microstructure.cpp)
+target_link_libraries(validate_microstructure PRIVATE exchange_core_lib)
